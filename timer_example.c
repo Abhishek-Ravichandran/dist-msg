@@ -71,6 +71,8 @@ void *startElectionTimer(void *args) {
   sleep(ELECTION_WAIT_TIME);
   printf("FINISHED ELECTION TIMER for election %d\n", es->id);
 
+  // code to check election responses
+
   pthread_exit(NULL);
 }
 
@@ -80,6 +82,8 @@ void *startMulticastAckTimer(void *args) {
   printf("STARTED MULTICAST TIMER Acks for message  %d\n", as->id);
   sleep(ACK_WAIT_TIME);
   printf("FINISHED MULTICAST TIMER Acks for message %d\n", as->id);
+
+  // code to check if ack received
 
   pthread_exit(NULL);
 }
