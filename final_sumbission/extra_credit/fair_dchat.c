@@ -349,7 +349,7 @@ void handle_msg(char* str) {
     
     if(msg_sq_no > last_seq_no_rcvd) {
         printf("%s\n", msg_to_print);
-        printf("%d\n", n++);
+        //printf("%d\n", n++);
         last_seq_no_rcvd = msg_sq_no;
         
         if(local_user->user_id == id_of_sender) {
