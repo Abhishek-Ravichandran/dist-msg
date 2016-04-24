@@ -281,11 +281,14 @@ void handle_msg(char* str, struct sockaddr_in sender_socket) {
     int seq_no = atoi(strtok(NULL, "\n"));
     
     if(seq_no == local_user->highest_seen + 1) {
+        // printf("NEW MESSAGE SEQ NO: %d HIGHEST SEEN: %d\n", seq_no, local_user->highest_seen);
         local_user->highest_seen = seq_no;
         
         printf("%s\n", msg);
         
+        // printf("HIGHEST SUGGESTED: %d HIGHEST SEEN: %d\n", highest_suggested, local_user->highest_seen);
         if(highest_suggested < local_user->highest_seen) {
+            // printf("REVISING MY OPINIONS!\n");
             highest_suggested = local_user->highest_seen;
         }
         
@@ -314,7 +317,8 @@ void handle_seq_no_request(char* str, struct sockaddr_in sender_socket) {
                     
                     char* payload;
                     asprintf(&payload, "sequence-num-proposed\n%d\n", ++highest_suggested);
-
+                    // printf("PROPOSING: %d\n", highest_suggested);
+                    
                     if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(sender_socket), sizeof(struct sockaddr))==-1) {
                         perror("Sendto error\n");
     	                exit(1);
@@ -491,6 +495,7 @@ void* checkSendQueue(void* args) {
                 curr = curr->next;
             }
             
+            // printf("HIGHEST SUGGESTED SEQ NO WAS: %d\n", max_seq_no);
             asprintf(&payload, "%s%d\n", msg_to_send, max_seq_no);
             
             curr = head;
@@ -837,6 +842,7 @@ int main(int argc, char* argv[]) {
         		if(strcmp(msg_type, "ping") == 0) {
         		    handle_ping(sender_socket);
         		}
+        		
             }
             
             //something occurred on stdin
@@ -847,8 +853,15 @@ int main(int argc, char* argv[]) {
                 num_bytes = read(0, buffer, sizeof(buffer));
                 buffer[num_bytes] = '\0';
                 
-                asprintf(&payload, "message\n%s%s", getPayload(local_user->user_name, "::"), buffer);
-        	    add_msg_to_queue(payload, sendQueue);
+                if(strcmp(buffer, "\0") == 0) {
+
+                    exit(0);
+                }
+                else {
+                      asprintf(&payload, "message\n%s%s", getPayload(local_user->user_name, "::"), buffer);
+                      add_msg_to_queue(payload, sendQueue);
+                }
+                
             }
         }
 	}
