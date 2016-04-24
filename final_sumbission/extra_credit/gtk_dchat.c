@@ -16,11 +16,17 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <signal.h>
+#include <gtk/gtk.h>
 
 #define BUFFER_SIZE 2000
 #define SHARED 0
 
 //global variables
+
+int headerCounter = 0;
+
+int clientCheckCounter = 0;
+int pingServerCounter = 0;
 
 //declare user list
 struct userListObj* head;
@@ -30,6 +36,15 @@ struct user* local_user;
 
 //local socket fd
 int local_socket_fd = 0;
+
+//declare threads
+pthread_t sendThread;
+pthread_t broadcastThread;
+pthread_t connectThread;
+pthread_t pingThread;
+pthread_t checkClientThread;
+pthread_t checkServerThread;
+pthread_t printThread;
 
 // msg id counter
 int messageIdCounter;
@@ -50,7 +65,7 @@ struct user {
     struct sockaddr_in user_socket;
     int is_leader;
     int lastAcknowledgedMsg;
-    time_t time_last_alive;
+    int time_last_alive;
     int hasJoinedChat;
     int isAlive;
     int isHoldingElection;
@@ -74,7 +89,7 @@ struct messageListObj {
 struct queueObj {
     struct messageListObj* headMsg;
     pthread_mutex_t queue_mutex;
-    sem_t queue_sem;
+    sem_t *queue_sem;
 };
 
 struct queueObj* undeliveredQueue;
@@ -83,8 +98,22 @@ struct queueObj* add_msg_to_queue(char*, struct queueObj*, int);
 
 //struct for connect thread
 struct connectThreadObj {
-    sem_t joinedSem;  
+    sem_t *joinedSem;  
 };
+
+//init struct for send queue access
+struct queueObj* sendQueue;   
+//init struct for broadcast queue access
+struct queueObj* broadcastQueue;    
+//init struct for connect thread
+struct connectThreadObj* connectObj;
+
+int numArgs;
+char* userName;
+char* connectingInfo;
+int hasShownJoinedInfo = 0;
+char* joinedInfo;
+int isGtkSetup = 0;
 
 void updateLastAlive(struct user *obj) {
     obj->time_last_alive = time(NULL);
@@ -289,7 +318,7 @@ void send_join_msg(char *str, struct user* obj) {
     coordinator_socket.sin_port = htons(atoi(strtok(NULL,"\n")));
     coordinator_socket.sin_family = AF_INET;
     bzero(&(coordinator_socket.sin_zero), 8);
-    
+
     payload = getPayload("join\n", convertUsertoString(local_user));
     
     if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(coordinator_socket), sizeof(struct sockaddr))==-1) {
@@ -326,40 +355,6 @@ void handle_message_ack(char* str) {
     }
 }
 
-void handle_msg(char* str) {
-    char* payload;
-    
-    static int n = 0;
-    
-    char* msg_to_print = strtok(str, "\n");
-    int id_of_sender = atoi(strtok(NULL, "\n"));
-    int sender_seq_no = atoi(strtok(NULL, "\n"));
-    int msg_sq_no = atoi(strtok(NULL, "\n"));
-    
-    
-    if(msg_sq_no > last_seq_no_rcvd) {
-        printf("%s\n", msg_to_print);
-        //printf("%d\n", n++);
-        last_seq_no_rcvd = msg_sq_no;
-        
-        if(local_user->user_id == id_of_sender) {
-            // printf("In here!\n");
-            // sem_wait(&(undeliveredQueue->queue_sem));
-            pthread_mutex_lock(&(undeliveredQueue->queue_mutex));
-            undeliveredQueue->headMsg = undeliveredQueue->headMsg->next;
-            pthread_mutex_unlock(&(undeliveredQueue->queue_mutex));
-            // printf("Outta here!\n");
-        }
-    }
-    
-    payload = getPayload(getPayload("ack-msg\n", getNumAsString(local_user->user_id)), getNumAsString(msg_sq_no));
-    
-    if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(head->userObj->user_socket), sizeof(struct sockaddr))==-1) {
-        perror("Sendto error\n");
-        exit(1);
-    }
-}
-
 void handle_msg_request(char* str, struct queueObj* queue) {
     // printf("Message request received: %s\n", str);
     // printf("DONE!\n");
@@ -373,9 +368,11 @@ void handle_msg_request(char* str, struct queueObj* queue) {
     
     while(curr != NULL) {
         if(curr->userObj->user_id == id_of_sender) {
+            //printf("local seq no %d\n sender seq no %d\n", curr->userObj->last_local_seq_no_rcvd,sender_seq_no);
             if(curr->userObj->last_local_seq_no_rcvd + 1 == sender_seq_no) {
                 curr->userObj->last_local_seq_no_rcvd = sender_seq_no;
                 payload = getPayload("message\n", str);
+                //printf("ADDING MESSAGE TO BROADCAST QUEUE: %s\n", payload);
                 add_msg_to_queue(payload, queue,0);
             }
             
@@ -431,13 +428,18 @@ void handle_alive_yes(char* str, struct sockaddr_in sender_socket) {
     }
 }
 
-struct queueObj* add_msg_to_queue(char* text, struct queueObj* queue, int id) {
+struct queueObj* add_msg_to_queue(char* text, struct queueObj* queue, int msg_id) {
+    //printf("ADDING MESSAGE: %s\n", text);
+
     pthread_mutex_lock(&(queue->queue_mutex));
     struct messageListObj* curr = queue->headMsg;
     struct messageListObj* newMsg= (struct messageListObj*)malloc(sizeof(struct messageListObj));
     newMsg->msg = text;
     newMsg->next = NULL;
-    newMsg->msg_id = id;
+
+   
+    
+    newMsg->msg_id = msg_id;
     
     if(curr != NULL) {
         while(curr->next != NULL)
@@ -449,7 +451,7 @@ struct queueObj* add_msg_to_queue(char* text, struct queueObj* queue, int id) {
     }
     
     pthread_mutex_unlock(&(queue->queue_mutex));
-    sem_post(&(queue->queue_sem));
+    sem_post(queue->queue_sem);
     return queue;
 }
 
@@ -548,17 +550,20 @@ void* hold_election(void* args) {
     local_user->isHoldingElection = 0;      //leader
     add_msg_to_queue(string, queue, msg_id);
     
+    
     pthread_exit(NULL);
 }
 //thread function for checking send queue
 void* checkSendQueue(void* args) {
     struct queueObj* queue = args;
     while(1) {
-        sem_wait(&(queue->queue_sem));
+        //printf("%s\n", "CHECKING SEND QUEUE");
+        sem_wait(queue->queue_sem);
         if (local_user->isHoldingElection == 1) {
-            sem_post(&(queue->queue_sem));
+            sem_post(queue->queue_sem);
             continue;
         }
+        //printf("%s\n", "CHECKING SEND QUEUE 2");
         
         char* msg_to_send = queue->headMsg->msg;
         if(last_local_seq_no_acked == local_seq_no + 1) {
@@ -567,9 +572,9 @@ void* checkSendQueue(void* args) {
             queue->headMsg = queue->headMsg->next;
             pthread_mutex_unlock(&(queue->queue_mutex));
             // sleep(1);
-        }
-        else {
-            
+            //printf("%s\n", "CHECKING SEND QUEUE 3");
+        } else {
+            //printf("SENDING MESSAGE %s\n", msg_to_send);
             pthread_mutex_lock(&(queue->queue_mutex));
             char* payload;
             asprintf(&payload, "%s%d\n%d\n", msg_to_send, local_user->user_id, local_seq_no + 1);
@@ -577,9 +582,11 @@ void* checkSendQueue(void* args) {
                 perror("Sendto error in send_join_message\n");
                 exit(1);
             }
+
+            //printf("%s\n", "CHECKING SEND QUEUE 4");
             
             pthread_mutex_unlock(&(queue->queue_mutex));
-            sem_post(&(queue->queue_sem));
+            sem_post(queue->queue_sem);
         }
             
         usleep(10*1000);
@@ -593,7 +600,7 @@ void* checkBroadcastQueue(void* args) {
     
     while(1) {
         
-        sem_wait(&(queue->queue_sem));
+        sem_wait(queue->queue_sem);
         // if(strcmp(local_user->user_name, "Bob") == 0) {
         //     printf("I don't see anything\n");
         //     continue;
@@ -627,12 +634,30 @@ void* checkBroadcastQueue(void* args) {
             last_seq_no_sent += 1;
         }
         else
-            sem_post(&(queue->queue_sem));
+            sem_post(queue->queue_sem);
         
         pthread_mutex_unlock(&(queue->queue_mutex)); 
         usleep(10*1000);
     }
 }
+
+// gtk attributes
+GtkWidget *window;
+GtkWidget *vbox, *hbox;
+GtkWidget *entry;
+GtkWidget *button;
+GtkWidget *check;
+gint tmp_pos;
+
+GtkTextBuffer *buffer;
+GtkTextIter start, end;
+GtkTextIter iter;
+GtkWidget *view;
+GtkWidget* msgView;
+
+GtkTextBuffer *fBuffer;
+GtkWidget *fView;
+GtkTextIter fIter;
 
 //thread function for checking initial connection
 void* checkConnected(void* args) {
@@ -641,30 +666,28 @@ void* checkConnected(void* args) {
     int startTime = time(NULL);
     
     while(1) {
+        sleep(5);
+        //printf("CHEKCING CONNECTED START: %d CURR %ld\n",startTime, time(NULL));
         if(time(NULL) - startTime > 30) {
             printf("Sorry, no chat is active on %s:%d, try again later.\nBye.\n",inet_ntoa(coordinator_socket.sin_addr),ntohs(coordinator_socket.sin_port));
             exit(1);    
         }
         
         if(local_user->hasJoinedChat == 1) {
-            printf("Succeeded, current users:\n");
-            print_user_list();
-            if(local_user->is_leader == 1)
-                printf("Waiting for others to join...\n");
-            pthread_exit(NULL);
+          pthread_exit(NULL);
         }
          //get join payload
         payload = getPayload("join\n", convertUsertoString(local_user));
-        
+      
         //send join message to coordinator
         if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &coordinator_socket, sizeof(struct sockaddr_in))==-1) {
-            printf("Sorry, no chat is active on %s:%d, try again later.\nBye.\n",inet_ntoa(coordinator_socket.sin_addr),ntohs(coordinator_socket.sin_port));
+          printf("Sorry, no chat is active on %s:%d, try again later.\nBye.\n",inet_ntoa(coordinator_socket.sin_addr),ntohs(coordinator_socket.sin_port));
             exit(1); 
         }
-        
-        sleep(1);
     }
 }
+
+
 
 //thread function for checking client liveness
 void* checkClientTimeStamps(void* args) {
@@ -672,33 +695,35 @@ void* checkClientTimeStamps(void* args) {
     struct queueObj* queue = args;
     char* payload;
     while(1) {
+        
         if(local_user->is_leader == 1) {
+            //gtk_text_buffer_insert(buffer, &iter, "1", -1);
+            //printf("CHECKING CLIENT TIMESTAMPS %d\n", clientCheckCounter);
+            clientCheckCounter++;
             time_t currentTime = time(NULL);
             curr = head;
             while(curr != NULL) {
                 if(curr->userObj->is_leader != 1) {
                     int delay = currentTime - curr->userObj->time_last_alive;
-                    // printf("USER: %s DELAY: %d\n", curr->userObj->user_name, delay);
-                    if (delay > 7) {
-                        // printf("DIED\n");
+
+                    if (delay > 15) {
                         handle_user_left(curr, queue);
                     }
                 }
                 curr = curr->next;
             }
         }
-        sleep(3);
+        sleep(5);
     }
 }
 
 //thread function for checking coordinator liveness
 void* checkServerTimeStamp(void* args) {
     while(1) {
-        if(local_user->is_leader != 1) {
+        //printf("%s\n", "CHECKING SERVER TIMESTAMPS");
+        if(local_user->isHoldingElection != 1 && local_user->is_leader != 1) {
             time_t currentTime = time(NULL);
-            int delay = currentTime - head->userObj->time_last_alive;
-            // printf("SERVER DELAY: %d\n", delay);
-            if(currentTime - head->userObj->time_last_alive > 7) {
+            if(currentTime - head->userObj->time_last_alive > 15) {
                 pthread_t electionThread;
                 local_user->isHoldingElection = 1;
                 local_seq_no = 0;
@@ -711,13 +736,17 @@ void* checkServerTimeStamp(void* args) {
                 pthread_join(electionThread, NULL);
             }
         }
-        sleep(3);
+        sleep(5);
     }
 }
 
 //thread function for pinging coordinator
 void* pingServer(void* args) {
     while(1) {
+        
+        //printf("PING SERVER %d\n", pingServerCounter);
+        //gtk_text_buffer_insert(buffer, &iter, "1", -1);
+        pingServerCounter++;
         if(local_user->is_leader != 1 && local_user->isHoldingElection == 0) {
             // create payload
             char *payload;
@@ -731,26 +760,243 @@ void* pingServer(void* args) {
                 }
             }
         }
-        sleep(3);
+        sleep(5);
     }
     
     pthread_exit(NULL);
 }
 
+
+
+
+static void enter_callback( GtkWidget *widget,
+                            GtkWidget *new_entry)
+{
+    const gchar *entry_text;
+    entry_text = gtk_entry_get_text (GTK_ENTRY (new_entry));
+    printf ("Entry contents: %s\n", entry_text);
+    char *en_text;
+    asprintf(&en_text, "%s\n", entry_text);
+    char *msg = getPayload(getPayload("message-request\n", getPayload(local_user->user_name, "::")), en_text);
+    int msg_id = ++messageIdCounter;
+    add_msg_to_queue(msg, undeliveredQueue, msg_id);
+    sendQueue = add_msg_to_queue(msg, sendQueue, msg_id);
+    gtk_entry_set_text (GTK_ENTRY (entry), "");
+}
+
+static void entry_toggle_editable( GtkWidget *checkbutton,
+                                   GtkWidget *entry )
+{
+  gtk_editable_set_editable (GTK_EDITABLE (entry),
+                             GTK_TOGGLE_BUTTON (checkbutton)->active);
+}
+
+static void entry_toggle_visibility( GtkWidget *checkbutton,
+                                     GtkWidget *entry )
+{
+  gtk_entry_set_visibility (GTK_ENTRY (entry),
+          GTK_TOGGLE_BUTTON (checkbutton)->active);
+}
+
+void handle_msg(char* str) {
+    char* payload;
+    
+    static int n = 0;
+    
+    char* msg_to_print = strtok(str, "\n");
+    int id_of_sender = atoi(strtok(NULL, "\n"));
+    int sender_seq_no = atoi(strtok(NULL, "\n"));
+    int msg_sq_no = atoi(strtok(NULL, "\n"));
+    //printf("%s\n", "GOT TO HANDLE MESSAGE");
+    
+    if(msg_sq_no > last_seq_no_rcvd) {
+        char *buffMsg;
+        asprintf(&buffMsg, "%s\n", msg_to_print);
+        gtk_text_buffer_insert(buffer, &iter, buffMsg, -1);
+
+        printf("%s\n", msg_to_print);
+        //printf("%d\n", n++);
+        last_seq_no_rcvd = msg_sq_no;
+        
+        if(local_user->user_id == id_of_sender) {
+            // printf("In here!\n");
+            // sem_wait(&(undeliveredQueue->queue_sem));
+            pthread_mutex_lock(&(undeliveredQueue->queue_mutex));
+            undeliveredQueue->headMsg = undeliveredQueue->headMsg->next;
+            pthread_mutex_unlock(&(undeliveredQueue->queue_mutex));
+            // printf("Outta here!\n");
+        }
+    }
+    
+    payload = getPayload(getPayload("ack-msg\n", getNumAsString(local_user->user_id)), getNumAsString(msg_sq_no));
+    
+    if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(head->userObj->user_socket), sizeof(struct sockaddr))==-1) {
+        perror("Sendto error\n");
+        exit(1);
+    }
+}
+
+static void exit_callback( GtkWidget *widget,
+                      gpointer   data )
+{
+    printf("%s\n", "PRESSED EXIT");
+    gtk_widget_destroy(GTK_WIDGET(window));
+    if(local_user->is_leader != 1) {
+        char *payload;
+        payload = getPayload("quit\n", getNumAsString(local_user->user_id));
+        add_msg_to_queue(payload, sendQueue, 0);
+    }
+
+    // kill threads
+    pthread_cancel(sendThread);
+    pthread_cancel(broadcastThread);
+    pthread_cancel(connectThread);
+    pthread_cancel(pingThread);
+    pthread_cancel(checkClientThread);
+    pthread_cancel(checkServerThread);
+    pthread_cancel(printThread);
+    exit(0);
+}
+
+void gtkSetup() {
+
+
+
+    gtk_init (NULL, NULL);
+
+    window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "dchat live!");
+    gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);// does not  matter this size
+    gtk_container_set_border_width (GTK_CONTAINER (window), 20);
+
+    vbox = gtk_vbox_new (FALSE, 0);
+    gtk_container_add (GTK_CONTAINER (window), vbox);
+
+
+    msgView = gtk_text_view_new();
+    GtkWidget* scroll = gtk_vscrollbar_new(gtk_text_view_get_vadjustment(GTK_TEXT_VIEW(msgView)));
+    entry = gtk_entry_new();
+
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(msgView), FALSE);
+
+    //gtk_text_view_set_top_margin(GTK_TEXT_VIEW(msgView),5);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(msgView),5);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(msgView),5);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(msgView),GTK_WRAP_WORD);
+
+    GtkWidget* table = gtk_table_new(3, 2, FALSE);
+
+    gtk_table_attach_defaults(GTK_TABLE(table), msgView, 0, 1, 0, 1);
+    gtk_table_attach_defaults(GTK_TABLE(table), scroll, 1, 2, 0, 1);
+    //gtk_table_attach_defaults(GTK_TABLE(table), entry, 0, 2, 1, 2);
+
+    //This code sets the preferred size for the widget, so it does not ask for extra space
+    gtk_widget_set_size_request(msgView, 700, 540);
+
+    gtk_container_add(GTK_CONTAINER(vbox), table);
+
+    gtk_box_pack_start (GTK_BOX (vbox), entry, TRUE, TRUE, 20);
+
+    
+
+    buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(msgView));
+    gtk_text_buffer_get_iter_at_offset(buffer, &iter, 0);
+    gtk_text_view_get_buffer(GTK_TEXT_VIEW(msgView));
+
+
+    // fView = gtk_text_view_new();
+    // fBuffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(fView));
+    // gtk_text_buffer_get_iter_at_offset(fBuffer, &fIter, 0);
+    // gtk_box_pack_start (GTK_BOX (vbox), fView, TRUE, TRUE, 0);
+
+
+
+
+    //gtk_text_buffer_insert(buffer, iter, "hello", -1);
+
+    gtk_entry_set_max_length (GTK_ENTRY (entry), 200);
+    g_signal_connect (entry, "activate",
+          G_CALLBACK (enter_callback),
+          entry);
+    gtk_entry_set_text (GTK_ENTRY (entry), "");
+    tmp_pos = GTK_ENTRY (entry)->text_length;
+    gtk_editable_select_region (GTK_EDITABLE (entry),
+              0, GTK_ENTRY (entry)->text_length);
+
+    gtk_window_set_resizable(GTK_WINDOW(window),FALSE);//because of this
+
+
+    PangoFontDescription *df;
+    df = pango_font_description_from_string("Monospace");
+    pango_font_description_set_size(df,15*PANGO_SCALE);
+    gtk_widget_modify_font(msgView, df);
+    gtk_widget_modify_font(entry, df);
+
+
+
+
+    
+    button = gtk_button_new ();
+    gtk_widget_set_size_request(button, 150,32);
+    gtk_widget_set_size_request(entry, 150,32);
+    GtkWidget *label;
+    label = gtk_label_new ("EXIT CHAT");
+    gtk_container_add (GTK_CONTAINER (button), label);
+
+    // g_signal_connect_swapped (button, "clicked",
+    //         G_CALLBACK (gtk_widget_destroy),
+    //         window);
+    g_signal_connect (button, "clicked",
+              G_CALLBACK (exit_callback), (gpointer) "LEAVE CHAT");
+
+    gtk_box_pack_start (GTK_BOX (vbox), button, TRUE, TRUE, 5);
+    gtk_widget_set_can_default (button, TRUE);
+    gtk_widget_grab_default (button);
+
+    sem_wait(connectObj->joinedSem);
+
+    gtk_widget_show_all(window);
+
+    //gtk_window_set_resizable(GTK_WINDOW(window),FALSE);
+    printf("%s\n", "GOT HERE IN GTK SETUP");
+    isGtkSetup = 1;
+
+    gtk_main();
+}
+
+void print_user_list_on_gui() {
+    struct userListObj* curr = head;
+
+    while(curr != NULL) {
+        //printf("%s %s:%d", curr->userObj->user_name, inet_ntoa(curr->userObj->user_socket.sin_addr),
+                //ntohs(curr->userObj->user_socket.sin_port));
+
+        char *uInfo;
+        asprintf(&uInfo, "%s %s:%d", curr->userObj->user_name, inet_ntoa(curr->userObj->user_socket.sin_addr),
+                ntohs(curr->userObj->user_socket.sin_port));
+
+        gtk_text_buffer_insert(buffer, &iter, uInfo, -1);
+
+        if(curr->userObj->is_leader) {
+            gtk_text_buffer_insert(buffer, &iter, " (leader)", -1);
+        }
+
+        gtk_text_buffer_insert(buffer, &iter, "\n", -1);
+        curr = curr->next;
+    }
+}
+
+
 void killHandler(int arg) {
     close(local_socket_fd);
     shutdown(local_socket_fd,0);
-}   
+}  
 
-int main(int argc, char* argv[]) {
-    
-    signal(SIGINT, killHandler);
-    
-    //check command-line args
-    if(argc != 2 && argc != 3) {
-        printf("Usage: ./dchat (NAME) | (NAME COORDINATOR_IP:COORDINATOR_PORT)\n");
-        exit(1);
-    }
+void* runClientthread() {
+    int argc = numArgs;
+
+    //for socket initialization
+    int yes = 1;
     
     //return value for select
     int select_retval = 0;
@@ -759,13 +1005,13 @@ int main(int argc, char* argv[]) {
     int num_bytes = 0;
     
     //size of socket object
-    int size_of_socket = sizeof(struct sockaddr);
+    unsigned int size_of_socket = sizeof(struct sockaddr);
     
     //message sequence number
     int sequence_number = 0;
     
-    //buffer for recvfrom
-    char buffer[BUFFER_SIZE];
+    //cBuffer for recvfrom
+    char cBuffer[BUFFER_SIZE];
     
     //payload for sendto
     char* payload;
@@ -778,35 +1024,51 @@ int main(int argc, char* argv[]) {
     //init local user object
     local_user = (struct user*)malloc(sizeof(struct user));
     
-    //init struct for send queue access
-    struct queueObj* sendQueue = (struct queueObj*)malloc(sizeof(struct queueObj));
-    sendQueue->headMsg = NULL;
-    sem_init(&(sendQueue->queue_sem), SHARED, 0);
-    
-    //init struct for broadcast queue access
-    struct queueObj* broadcastQueue = (struct queueObj*)malloc(sizeof(struct queueObj));
-    broadcastQueue->headMsg = NULL;
-    sem_init(&(broadcastQueue->queue_sem), SHARED, 0);
-    
-    //init struct for connect thread
-    struct connectThreadObj* connectObj = (struct connectThreadObj*)malloc(sizeof(struct connectThreadObj));
-    sem_init(&(connectObj->joinedSem), SHARED, 0);
-    
+    char* qSem;
+    asprintf(&qSem,"sendQSem%s",userName);
+    char* bSem;
+    asprintf(&bSem,"broadQSem%s",userName);
+    char* cSem;
+    asprintf(&cSem,"connSem%s",userName);
+    sem_unlink(qSem);
+    sem_unlink(bSem);
+    sem_unlink(cSem);
+
     undeliveredQueue = (struct queueObj*)malloc(sizeof(struct queueObj));;
     undeliveredQueue->headMsg = NULL;
+
+    //init struct for send queue access
+    sendQueue = (struct queueObj*)malloc(sizeof(struct queueObj));
+    sendQueue->headMsg = NULL;
+    //sem_init(&(sendQueue->queue_sem), SHARED, 0);
+    if ((sendQueue->queue_sem = sem_open(qSem, O_CREAT, 0777, 0)) == SEM_FAILED ) {
+        perror("sem_open");
+        exit(EXIT_FAILURE);
+    }
+    
+    //init struct for broadcast queue access
+    broadcastQueue = (struct queueObj*)malloc(sizeof(struct queueObj));
+    broadcastQueue->headMsg = NULL;
+    //sem_init(&(broadcastQueue->queue_sem), SHARED, 0);
+    if ((broadcastQueue->queue_sem = sem_open(bSem, O_CREAT, 0777, 0)) == SEM_FAILED ) {
+        perror("sem_open");
+        exit(EXIT_FAILURE);
+    }
+
+    
+    //init struct for connect thread
+    connectObj = (struct connectThreadObj*)malloc(sizeof(struct connectThreadObj));
+    //sem_init(&(connectObj->joinedSem), SHARED, 0);
+    if ((connectObj->joinedSem = sem_open(cSem, O_CREAT, 0777, 0)) == SEM_FAILED ) {
+        perror("sem_open");
+        exit(EXIT_FAILURE);
+    }
     
     //readset for select
     fd_set readset;
     FD_ZERO(&readset);
     
-    //declare threads
-    pthread_t sendThread;
-    pthread_t broadcastThread;
-    pthread_t connectThread;
-    pthread_t pingThread;
-    pthread_t checkClientThread;
-    pthread_t checkServerThread;
-    pthread_t printThread;
+    
     
     //initialize local UDP socket
     if((local_socket_fd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
@@ -821,14 +1083,15 @@ int main(int argc, char* argv[]) {
 //  }
     
     //set local user attributes
-    local_user->user_id = 0;
+    local_user->user_id = 1;
     local_user->isHoldingElection = 0;
-    strcpy(local_user->user_name, argv[1]);
+    strcpy(local_user->user_name, userName);
     local_user->time_last_alive = time(NULL);
     local_user->lastAcknowledgedMsg = 0;
     local_user->user_socket.sin_family = AF_INET;
-    local_user->user_socket.sin_port = htons(9000);
+    local_user->user_socket.sin_port = htons(8000);
     bzero(&(local_user->user_socket.sin_zero), 8);
+
     local_user->last_local_seq_no_rcvd = 0;
     
     //set local user IP address
@@ -863,22 +1126,36 @@ int main(int argc, char* argv[]) {
     
     //if coordinator
     if (argc == 2) {
-        local_user->user_id = 1;
         local_user->is_leader = 1;
         head = (struct userListObj*)malloc(sizeof(struct userListObj));
         head->userObj = local_user;
         head->next = NULL;
-        sem_post(&(connectObj->joinedSem));
+        sem_post(connectObj->joinedSem);
         local_user->hasJoinedChat = 1;
         printf("%s started a new chat, listening on %s:%d\n", local_user->user_name,inet_ntoa(local_user->user_socket.sin_addr),ntohs(local_user->user_socket.sin_port));
+        if (hasShownJoinedInfo == 0) {
+            while (1) {
+                if (isGtkSetup == 1) {
+                    char *uInfo;
+                    asprintf(&uInfo, "%s started a new chat, listening on %s:%d\n", local_user->user_name,inet_ntoa(local_user->user_socket.sin_addr),ntohs(local_user->user_socket.sin_port));
+                    gtk_text_buffer_insert(buffer, &iter, uInfo, -1);
+                    print_user_list_on_gui();
+                    if(local_user->is_leader == 1)
+                        gtk_text_buffer_insert(buffer, &iter, "Waiting for others to join...\n", -1);
+                    hasShownJoinedInfo = 1;
+                    break;
+                }
+            }
+      }
     } 
     //if connecting to coordinator
     else {
-        local_user->user_id = 0;
+            
+        
         local_user->is_leader = 0;
         //set coordinator socket attributes
         coordinator_socket.sin_family = AF_INET;
-        inet_aton(strtok(argv[2], ":"), &(coordinator_socket.sin_addr));
+        inet_aton(strtok(connectingInfo, ":"), &(coordinator_socket.sin_addr));
         coordinator_socket.sin_port = htons(atoi(strtok(NULL, "\0")));
         bzero(&(coordinator_socket.sin_zero), 8);
         printf("%s joining a new chat on %s:%d, listening on %s:%d\n", local_user->user_name, inet_ntoa(coordinator_socket.sin_addr), ntohs(coordinator_socket.sin_port),
@@ -893,6 +1170,17 @@ int main(int argc, char* argv[]) {
                 exit(1); 
             }
         }
+        
+        //get join payload
+        payload = getPayload("join\n", convertUsertoString(local_user));
+        
+        //send join message to coordinator
+        if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &coordinator_socket, size_of_socket)==-1) {
+            printf("Sorry, no chat is active on %s:%d, try again later.\nBye.\n",inet_ntoa(coordinator_socket.sin_addr),ntohs(coordinator_socket.sin_port));
+            exit(1); 
+        }
+        
+        
     }
     
     //start threads
@@ -919,8 +1207,8 @@ int main(int argc, char* argv[]) {
     
     while(1) {
         
-        //reset buffer
-        memset(buffer, '\0', BUFFER_SIZE - 1);
+        //reset cBuffer
+        memset(cBuffer, '\0', BUFFER_SIZE - 1);
         
         //set STDIN and socket in select readset
         FD_SET(0, &readset);
@@ -942,28 +1230,24 @@ int main(int argc, char* argv[]) {
             if (FD_ISSET(local_socket_fd, &readset)) {
             
                 //read bytes from socket
-                if ((num_bytes = recvfrom(local_socket_fd, buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&sender_socket, &size_of_socket)) == -1) {
+                if ((num_bytes = recvfrom(local_socket_fd, cBuffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&sender_socket, &size_of_socket)) == -1) {
                     perror("Recv Error");
                     exit(1);
                 }
                 
                 
-                buffer[num_bytes] = '\0';
-            //  printf("%s\n", buffer);
+                cBuffer[num_bytes] = '\0';
+                //printf("%s\n", cBuffer);
                 
                 //get message type and message
-                char* msg_type = strtok(buffer, "\n");
+                char* msg_type = strtok(cBuffer, "\n");
                 char* msg = strtok(NULL, "\0");
                 
                 
                 //if join message
                 if(strcmp(msg_type, "join") == 0) {
-                    
                     //if not coordinator, send coordinator info back to user
                     if(local_user->is_leader == 0) {
-                        if(local_user->isHoldingElection == 1) {
-                            continue;
-                        }
                         payload = getPayload("coordinator-info\n", convertUsertoString(head->userObj));
                         
                         if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &sender_socket, size_of_socket)==-1) {
@@ -987,7 +1271,7 @@ int main(int argc, char* argv[]) {
                             payload = add_user_string_to_list(msg);
                             broadcast_user_list();
                             int msg_id = ++messageIdCounter;
-                            add_msg_to_queue(payload, undeliveredQueue, msg_id);
+                            add_msg_to_queue(payload, undeliveredQueue,msg_id);
                             add_msg_to_queue(payload, sendQueue, msg_id);
                             
                         }
@@ -1019,6 +1303,7 @@ int main(int argc, char* argv[]) {
                     
                     local_user->isHoldingElection = 0;      //for other clients
                     if(local_user->hasJoinedChat == 0) {
+                        sem_post(connectObj->joinedSem);
                         if (pthread_create(&pingThread, NULL, &pingServer, NULL) != 0) {
                             perror("Pthread Create");
                             exit(1);
@@ -1028,6 +1313,24 @@ int main(int argc, char* argv[]) {
                             exit(1);
                         }
                         local_user->hasJoinedChat = 1;
+                    }
+
+                    if (hasShownJoinedInfo == 0) {
+                        while (1) {
+                            //printf("%s\n", "SHOULD BE CHECKING");
+                            if (isGtkSetup == 1) {
+                                char *uInfo;
+                                asprintf(&uInfo, "%s joining a new chat on %s:%d, listening on %s:%d\n", local_user->user_name, inet_ntoa(coordinator_socket.sin_addr), ntohs(coordinator_socket.sin_port), inet_ntoa(local_user->user_socket.sin_addr), ntohs(local_user->user_socket.sin_port));
+                                gtk_text_buffer_insert(buffer, &iter, uInfo, -1);
+                                //printf("%s\n", "PRINGIN JOIN INFO TO GUI");
+                                gtk_text_buffer_insert(buffer, &iter, "Succeeded, current users:\n", -1);
+                                print_user_list_on_gui();
+                                if(local_user->is_leader == 1)
+                                    gtk_text_buffer_insert(buffer, &iter, "Waiting for others to join...\n", -1);
+                                hasShownJoinedInfo = 1;
+                                break;
+                            }
+                        }
                     }
                 }
                 
@@ -1045,6 +1348,7 @@ int main(int argc, char* argv[]) {
                 if(strcmp(msg_type, "message") == 0) {
                   //  printf("GOT MESSAGE\n");
                   //  printf("GOT NEW MESSAGE!\n");
+                    //printf("GOT MESSAGE %s\n", msg);
                     handle_msg(msg);
                 }
                 
@@ -1073,17 +1377,14 @@ int main(int argc, char* argv[]) {
                     handle_alive_req(sender_socket);
                 }
                 
-                //if alive req - respond alive yes a
-                int x = 1;
+                //if alive req - respond alive yes
                 if(strcmp(msg_type, "alive-yes") == 0) {
                     handle_alive_yes(msg, sender_socket);
                 }
                 
                 if(strcmp(msg_type, "socket-used") == 0) {
-                    if (local_user->hasJoinedChat == 0) {
-                        printf("Socket Already In Use!\n");
-                        exit(0);   
-                    }
+                    printf("Socket Already In Use!\n");
+                    exit(0);
                 }
                 
                 if(strcmp(msg_type, "message-request-ack") == 0) {
@@ -1097,27 +1398,22 @@ int main(int argc, char* argv[]) {
             //something occurred on stdin
             if(FD_ISSET(0, &readset)) {
                 
-                //read text from stdin into buffer
-                memset(buffer, '\0', BUFFER_SIZE - 1);
-                num_bytes = read(0, buffer, sizeof(buffer));
-                buffer[num_bytes] = '\0';
+                //read text from stdin into cBuffer
+                memset(cBuffer, '\0', BUFFER_SIZE - 1);
+                num_bytes = read(0, cBuffer, sizeof(cBuffer));
+                cBuffer[num_bytes] = '\0';
                 
-                if(strcmp(buffer, "\0") == 0) {
+                if(strcmp(cBuffer, "\0") == 0) {
                     if(local_user->is_leader != 1) {
                         payload = getPayload("quit\n", getNumAsString(local_user->user_id));
-                        
-                        if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(head->userObj->user_socket), sizeof(struct sockaddr))==-1) {
-                            perror("Sendto error in send_join_message\n");
-                            exit(1);
-                        }
-                        
+                        add_msg_to_queue(payload, sendQueue, 0);
                     }
                     exit(0);
                 }
                 else {
                 //push text into send queue
                // printf("HERE!\n");
-               asprintf(&payload, "message-request\n%s%s", getPayload(local_user->user_name, "::"), buffer);
+               asprintf(&payload, "message-request\n%s%s", getPayload(local_user->user_name, "::"), cBuffer);
                int msg_id = ++messageIdCounter;
                add_msg_to_queue(payload, undeliveredQueue, msg_id);
                sendQueue = add_msg_to_queue(payload, sendQueue, msg_id);
@@ -1128,6 +1424,34 @@ int main(int argc, char* argv[]) {
         }
         
     }
+    pthread_exit(NULL);
+} 
+
+
+int main(int argc, char* argv[]) {
+    
+    signal(SIGINT, killHandler);
+    
+    //check command-line args
+    if(argc != 2 && argc != 3) {
+        printf("Usage: ./dchat (NAME) | (NAME COORDINATOR_IP:COORDINATOR_PORT)\n");
+        exit(1);
+    }
+
+    numArgs = argc;
+    userName = argv[1];
+    if (argc == 3) {
+        connectingInfo = argv[2];
+    }
+
+    pthread_t clientThread;
+
+    if (pthread_create(&clientThread, NULL, &runClientthread, NULL) != 0) {
+      perror("Pthread Create");
+      exit(1);
+    }
+
+    gtkSetup();
     
     return 0;
 }
