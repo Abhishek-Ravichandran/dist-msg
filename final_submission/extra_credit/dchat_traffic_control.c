@@ -269,13 +269,15 @@ void update_user_list(char* user_list_string) {
     curr = head;
     
     while(curr != NULL) {
-        if(strcmp(curr->userObj->user_name, local_user->user_name) == 0) {
-            if(curr->userObj->lastAcknowledgedMsg == 0 || local_user->lastAcknowledgedMsg == 0) {
-                last_seq_no_rcvd = curr->userObj->lastAcknowledgedMsg;
-                local_user->lastAcknowledgedMsg = curr->userObj->lastAcknowledgedMsg;
+        if(curr->userObj->user_socket.sin_addr.s_addr == local_user->user_socket.sin_addr.s_addr) {
+            if(curr->userObj->user_socket.sin_port == local_user->user_socket.sin_port) {
+                if(curr->userObj->lastAcknowledgedMsg == 0 || local_user->lastAcknowledgedMsg == 0) {
+                    last_seq_no_rcvd = curr->userObj->lastAcknowledgedMsg;
+                    local_user->lastAcknowledgedMsg = curr->userObj->lastAcknowledgedMsg;
+                }
+                local_user->user_id = curr->userObj->user_id;
+                break;
             }
-            local_user->user_id = curr->userObj->user_id;
-            break;
         }
         curr = curr->next;
     }
@@ -302,7 +304,7 @@ int check_if_socket_used(struct sockaddr_in sender_socket) {
     struct userListObj* curr = head;
     
     while(curr != NULL) {
-        if(strcmp(inet_ntoa(curr->userObj->user_socket.sin_addr),  inet_ntoa(sender_socket.sin_addr)) == 0)
+        if(curr->userObj->user_socket.sin_addr.s_addr == sender_socket.sin_addr.s_addr)
             if(curr->userObj->user_socket.sin_port == sender_socket.sin_port)
                 return 1;
         curr = curr->next;
@@ -328,9 +330,7 @@ void handle_message_ack(char* str) {
 
 void handle_msg(char* str) {
     char* payload;
-   static int n = 0;
-    
-    
+
     char* msg_to_print = strtok(str, "\n");
     int id_of_sender = atoi(strtok(NULL, "\n"));
     int sender_seq_no = atoi(strtok(NULL, "\n"));
@@ -339,7 +339,7 @@ void handle_msg(char* str) {
     
     if(msg_sq_no > last_seq_no_rcvd) {
         printf("%s\n", msg_to_print);
-        printf("%d\n",n++);
+
         last_seq_no_rcvd = msg_sq_no;
         
         if(local_user->user_id == id_of_sender) {
@@ -652,7 +652,7 @@ void* TrafficControl(void* args){
             sleep(3);
             while(curr!=NULL) {
                 slowdownby = 0;
-                if(curr->userObj->num_msgs > 10) {
+                if(curr->userObj->num_msgs > 5) {
                     slowdownby = 2;
                 }
                 asprintf(&string, "traffic\n%d\n", slowdownby);
@@ -976,7 +976,7 @@ int main(int argc, char* argv[]) {
         		//traffic control parsing 
         		if(strcmp(msg_type,"traffic")==0){
         		    int sleepfor = atoi(strtok(msg,"\n"));
-        		    printf(" Sleep for: %d\n",sleepfor);
+        		  //  printf(" Sleep for: %d\n",sleepfor);
         		    local_user->sleep_time = sleepfor;
         		}
         		
