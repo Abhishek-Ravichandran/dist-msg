@@ -291,15 +291,14 @@ void handle_msg(char* str, struct sockaddr_in sender_socket) {
             printf("REVISING MY OPINIONS!\n");
             highest_suggested = local_user->highest_seen;
         }
-        
-        char* payload;
+    }
     
-        asprintf(&payload, "ack-msg\n%d\n", seq_no);
+    char* payload;
+    asprintf(&payload, "ack-msg\n%d\n", seq_no);
         
-        if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(sender_socket), sizeof(struct sockaddr))==-1) {
-            perror("Sendto error\n");
-        	exit(1);
-        }
+    if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(sender_socket), sizeof(struct sockaddr))==-1) {
+        perror("Sendto error\n");
+        exit(1);
     }
 }
 
@@ -438,11 +437,13 @@ void remove_user_from_list(struct userListObj *toRemoveUserListObj, struct queue
 	
 	if(head->userObj->user_socket.sin_addr.s_addr == toRemoveUserListObj->userObj->user_socket.sin_addr.s_addr) {
 	    if(head->userObj->user_socket.sin_port == toRemoveUserListObj->userObj->user_socket.sin_port) {
+	        char* leftName;
+	        asprintf(&leftName, "%s", head->userObj->user_name);
 	        if(head->next != NULL) {
 	            struct userListObj* temp = head->next;
 	            free(head);
 	            head = temp;
-	            asprintf(&payload, "message\nNOTICE %s left the chat or crashed\n", head->userObj->user_name);
+	            asprintf(&payload, "message\nNOTICE %s left the chat or crashed\n", leftName);
 	            add_msg_to_queue(payload, queue);
 	            broadcast_user_list();
 	            return;
@@ -488,6 +489,7 @@ void* checkSendQueue(void* args) {
         
         while(curr != NULL) {
             if(curr->userObj->highest_suggested == -1 && curr->userObj->hasJoinedChat == 1) {
+                // printf("DIS GUY: %s NO: %d\n", curr->userObj->user_name, curr->userObj->highest_suggested);
                 all_suggested = 0;
                 if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(curr->userObj->user_socket), sizeof(struct sockaddr))==-1) {
     	            perror("Sendto error\n");
@@ -518,6 +520,7 @@ void* checkSendQueue(void* args) {
             
             while(curr != NULL) {
                 if(curr->userObj->last_seq_no_acked < highest_suggested && curr->userObj->hasJoinedChat == 1) {
+                    // printf("HASNT ACKED: %s\n", curr->userObj->user_name);
                     all_ack = 0;
                     
                     if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(curr->userObj->user_socket), sizeof(struct sockaddr))==-1) {
@@ -552,7 +555,7 @@ void* checkSendQueue(void* args) {
             sem_post(&(queue->queue_sem));
         
         pthread_mutex_unlock(&(queue->queue_mutex));
-        usleep(10*1000);
+        usleep(100*1000);
     }
 }
 
@@ -615,6 +618,31 @@ void* checkAlive(void* args) {
         }
     
         sleep(2);
+    }
+}
+
+int check_if_socket_used(struct sockaddr_in sender_socket) {
+    struct userListObj* curr = head;
+    
+    while(curr != NULL) {
+        if(curr->userObj->user_socket.sin_addr.s_addr == sender_socket.sin_addr.s_addr) {
+            if(curr->userObj->user_socket.sin_port == sender_socket.sin_port) {
+                return 1;
+            }
+        }
+        curr = curr->next;
+    }
+    
+    return 0;
+}
+
+void refuse_connection(struct sockaddr_in sender_socket) {
+    
+    char* payload = "cant-connect";
+    
+    if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(sender_socket), sizeof(struct sockaddr))==-1) {
+        perror("Sendto error\n");
+        exit(1);
     }
 }
 
@@ -817,8 +845,11 @@ int main(int argc, char* argv[]) {
         		char* msg = strtok(NULL, "\0");
         		
         		if(strcmp(msg_type, "join") == 0) {
-        		    add_msg_to_queue(add_new_user_to_list(msg), sendQueue);
-        		    continue;
+        		    if(check_if_socket_used(sender_socket) == 1) {
+        		        refuse_connection(sender_socket);
+        		    }
+        		    else
+        		        add_msg_to_queue(add_new_user_to_list(msg), sendQueue);
         		}
         		
         		if(strcmp(msg_type, "list") == 0) {
@@ -837,38 +868,44 @@ int main(int argc, char* argv[]) {
                         haveStarted = 1;
         		    }
         		    
-        		    continue;
+        		  //  continue;
         		}
         		
         		if(strcmp(msg_type, "message") == 0) {
         		    handle_msg(msg, sender_socket);
-        		    continue;
+        		  //  continue;
         		}
         		
         		if(strcmp(msg_type, "notice") == 0) {
         		    handle_msg(msg, sender_socket);
-        		    continue;
+        		  //  continue;
         		}
         		
         		if(strcmp(msg_type, "sequence-num-request") == 0) {
         		    handle_seq_no_request(msg, sender_socket);
-        		    continue;
+        		  //  continue;
         		}
         		
         		if(strcmp(msg_type, "ack-msg") == 0) {
         		    handle_msg_ack(msg, sender_socket);
-        		    continue;
+        		  //  continue;
         		}
         		
         		if(strcmp(msg_type, "sequence-num-proposed") == 0) {
         		    handle_seq_no_proposed(msg, sender_socket);
-        		    continue;
+        		  //  continue;
         		}
         		
         		if(strcmp(msg_type, "ping") == 0) {
         		    handle_ping(sender_socket);
-        		    continue;
+        		  //  continue;
         		}
+        		
+        		if(strcmp(msg_type, "cant-connect") == 0) {
+        		    printf("Socket already in use!\n");
+        		    exit(0);
+        		}
+        		
         		
             }
             
