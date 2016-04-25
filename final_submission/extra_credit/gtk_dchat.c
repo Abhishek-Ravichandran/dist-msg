@@ -729,6 +729,7 @@ void* checkServerTimeStamp(void* args) {
                 local_seq_no = 0;
                 last_local_seq_no_acked = 0;
                 printf("HOLDING ELECTION\n");
+                gtk_text_buffer_insert(buffer, &iter, "HOLDING ELECTION\n", -1);
                 if (pthread_create(&electionThread, NULL, &hold_election, (void*)args) != 0) {
                     perror("Pthread Create");
                     exit(1);
@@ -798,6 +799,24 @@ static void entry_toggle_visibility( GtkWidget *checkbutton,
           GTK_TOGGLE_BUTTON (checkbutton)->active);
 }
 
+void updateScrollPosition() {       
+    // GtkTextBuffer           *mybuffer;
+    // GtkTextIter             myiter;
+    
+    // /* get the text buffer */
+    // mybuffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (msgView));
+   
+    // /* get end iter */
+    // gtk_text_buffer_get_end_iter (mybuffer, &myiter);
+    
+    // /* scroll to end iter */
+    // gtk_text_view_scroll_to_iter (GTK_TEXT_VIEW (msgView),
+    //                               &myiter, 0.0, TRUE, 1.0, 1.0);
+
+    GtkTextMark *mk = gtk_text_buffer_get_mark (buffer, "insert");
+    gtk_text_view_scroll_to_mark (GTK_TEXT_VIEW (msgView), mk, 0.0, FALSE, 0.0, 0.0);
+}
+
 void handle_msg(char* str) {
     char* payload;
     
@@ -813,6 +832,8 @@ void handle_msg(char* str) {
         char *buffMsg;
         asprintf(&buffMsg, "%s\n", msg_to_print);
         gtk_text_buffer_insert(buffer, &iter, buffMsg, -1);
+        updateScrollPosition();
+        usleep(50*1000);
 
         printf("%s\n", msg_to_print);
         //printf("%d\n", n++);
@@ -1383,8 +1404,10 @@ void* runClientthread() {
                 }
                 
                 if(strcmp(msg_type, "socket-used") == 0) {
-                    printf("Socket Already In Use!\n");
-                    exit(0);
+                    if (local_user->hasJoinedChat == 0) {
+                        printf("Socket Already In Use!\n");
+                        exit(0);   
+                    }
                 }
                 
                 if(strcmp(msg_type, "message-request-ack") == 0) {
