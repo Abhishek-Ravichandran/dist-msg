@@ -281,14 +281,14 @@ void handle_msg(char* str, struct sockaddr_in sender_socket) {
     int seq_no = atoi(strtok(NULL, "\n"));
     
     if(seq_no == local_user->highest_seen + 1) {
-        // printf("NEW MESSAGE SEQ NO: %d HIGHEST SEEN: %d\n", seq_no, local_user->highest_seen);
+        printf("NEW MESSAGE SEQ NO: %d HIGHEST SEEN: %d\n", seq_no, local_user->highest_seen);
         local_user->highest_seen = seq_no;
         
         printf("%s\n", msg);
         
-        // printf("HIGHEST SUGGESTED: %d HIGHEST SEEN: %d\n", highest_suggested, local_user->highest_seen);
+        printf("HIGHEST SUGGESTED: %d HIGHEST SEEN: %d\n", highest_suggested, local_user->highest_seen);
         if(highest_suggested < local_user->highest_seen) {
-            // printf("REVISING MY OPINIONS!\n");
+            printf("REVISING MY OPINIONS!\n");
             highest_suggested = local_user->highest_seen;
         }
         
@@ -317,7 +317,7 @@ void handle_seq_no_request(char* str, struct sockaddr_in sender_socket) {
                     
                     char* payload;
                     asprintf(&payload, "sequence-num-proposed\n%d\n", ++highest_suggested);
-                    // printf("PROPOSING: %d\n", highest_suggested);
+                    printf("PROPOSING: %d\n", highest_suggested);
                     
                     if (sendto(local_socket_fd, payload, strlen(payload), 0, (struct sockaddr *) &(sender_socket), sizeof(struct sockaddr))==-1) {
                         perror("Sendto error\n");
@@ -434,6 +434,21 @@ void print_user_list() {
 
 void remove_user_from_list(struct userListObj *toRemoveUserListObj, struct queueObj* queue) {
 	struct userListObj *curr = head;
+	char* payload;
+	
+	if(head->userObj->user_socket.sin_addr.s_addr == toRemoveUserListObj->userObj->user_socket.sin_addr.s_addr) {
+	    if(head->userObj->user_socket.sin_port == toRemoveUserListObj->userObj->user_socket.sin_port) {
+	        if(head->next != NULL) {
+	            struct userListObj* temp = head->next;
+	            free(head);
+	            head = temp;
+	            asprintf(&payload, "message\nNOTICE %s left the chat or crashed\n", head->userObj->user_name);
+	            add_msg_to_queue(payload, queue);
+	            broadcast_user_list();
+	            return;
+	        }
+	    }
+	}
 	
 	if(curr != NULL) {
 	    while(curr->next != NULL) {
@@ -495,7 +510,7 @@ void* checkSendQueue(void* args) {
                 curr = curr->next;
             }
             
-            // printf("HIGHEST SUGGESTED SEQ NO WAS: %d\n", max_seq_no);
+            printf("HIGHEST SUGGESTED SEQ NO WAS: %d\n", max_seq_no);
             asprintf(&payload, "%s%d\n", msg_to_send, max_seq_no);
             
             curr = head;
@@ -592,6 +607,7 @@ void* checkAlive(void* args) {
         int currentTime = time(NULL);
         
         while(curr != NULL) {
+            // printf("NAME: %s DELAY: %d\n", curr->userObj->user_name, currentTime - curr->userObj->time_last_alive);
             if(currentTime - curr->userObj->time_last_alive > 6) {
                 remove_user_from_list(curr, sendQueue);
             }
@@ -715,6 +731,16 @@ int main(int argc, char* argv[]) {
         printf("%s started a new chat, listening on %s:%d\n", local_user->user_name,inet_ntoa(local_user->user_socket.sin_addr),ntohs(local_user->user_socket.sin_port));
 	    sem_post(&(connectObj->joinedSem));
 	    local_user->hasJoinedChat = 1;
+	    if(pthread_create(&pingThread, NULL, &pingOthers, NULL) != 0) {
+	        perror("Pthread Create");
+	        exit(1);
+	   }
+	   
+	   if(pthread_create(&checkThread, NULL, &checkAlive, (void*)sendQueue) != 0) {
+	       perror("Pthread Create");
+	       exit(1);
+	   }
+	   haveStarted = 1;
 	} 
 	//if connecting to existing chat
 	else {
@@ -841,6 +867,7 @@ int main(int argc, char* argv[]) {
         		
         		if(strcmp(msg_type, "ping") == 0) {
         		    handle_ping(sender_socket);
+        		    continue;
         		}
         		
             }

@@ -652,7 +652,7 @@ void* TrafficControl(void* args){
             sleep(3);
             while(curr!=NULL) {
                 slowdownby = 0;
-                if(curr->userObj->num_msgs > 5) {
+                if(curr->userObj->num_msgs > 10) {
                     slowdownby = 2;
                 }
                 asprintf(&string, "traffic\n%d\n", slowdownby);
